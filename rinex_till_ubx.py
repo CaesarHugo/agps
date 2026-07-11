@@ -1,18 +1,3 @@
-#!/usr/bin/env python3
-"""
-rinex_till_ubx.py - Egen A-GPS-server for u-blox 6 (NEO-6M)
-============================================================
-Hamtar farsk broadcast-ephemeris (RINEX 2 nav) fran BKG:s oppna
-IGS-spegel, packar om den till UBX-AID-EPH-meddelanden och skriver
-allt till en binarfil (aid.ubx) som ESP32:n kan ladda ner och pipa
-rakt in i GPS-modulen.
-
-Anvandning:
-  python3 rinex_till_ubx.py            # hamta + konvertera -> aid.ubx
-  python3 rinex_till_ubx.py --selftest # verifiera bitpackningen (ingen natverksatkomst)
-
-Kors normalt av GitHub Actions varje timme (se .github/workflows/aid.yml).
-"""
 
 import sys, math, gzip, struct, io, urllib.request
 from datetime import datetime, timedelta, timezone
@@ -177,6 +162,22 @@ def _f(s):
     s = s.strip().replace('D', 'E').replace('d', 'E')
     return float(s) if s else 0.0
 
+def _post_fran_varden(prn, epok, v):
+    """Gemensam mappning: 28 varden i RINEX-ordning -> ephemeris-dict."""
+    gpssek_epok = (epok - datetime(1980, 1, 6, tzinfo=timezone.utc)).total_seconds()
+    return {
+        'prn': prn, 'epok': epok,
+        'af0': v[0], 'af1': v[1], 'af2': v[2],
+        'IODE': v[3], 'Crs': v[4], 'DeltaN': v[5], 'M0': v[6],
+        'Cuc': v[7], 'e': v[8], 'Cus': v[9], 'sqrtA': v[10],
+        'Toe': v[11], 'Cic': v[12], 'OMEGA0': v[13], 'Cis': v[14],
+        'i0': v[15], 'Crc': v[16], 'omega': v[17], 'OMEGADOT': v[18],
+        'IDOT': v[19], 'week': v[21],
+        'accuracy': v[23], 'health': v[24], 'TGD': v[25], 'IODC': v[26],
+        'ttx': v[27] if len(v) > 27 else 0.0,
+        'Toc': gpssek_epok % 604800,
+    }
+
 def parsa_rinex2(text):
     rader = text.splitlines()
     i = 0
@@ -203,49 +204,105 @@ def parsa_rinex2(text):
         except (ValueError, IndexError):
             i += 1
             continue
-        # v: af0 af1 af2 | IODE Crs Dn M0 | Cuc e Cus sqrtA | Toe Cic OM0 Cis
-        #    i0 Crc om OMdot | IDOT codesL2 week L2P | acc health TGD IODC | ttx fit ...
-        gpssek_epok = (epok - datetime(1980, 1, 6, tzinfo=timezone.utc)).total_seconds()
-        toc = gpssek_epok % 604800
-        poster.append({
-            'prn': prn, 'epok': epok,
-            'af0': v[0], 'af1': v[1], 'af2': v[2],
-            'IODE': v[3], 'Crs': v[4], 'DeltaN': v[5], 'M0': v[6],
-            'Cuc': v[7], 'e': v[8], 'Cus': v[9], 'sqrtA': v[10],
-            'Toe': v[11], 'Cic': v[12], 'OMEGA0': v[13], 'Cis': v[14],
-            'i0': v[15], 'Crc': v[16], 'omega': v[17], 'OMEGADOT': v[18],
-            'IDOT': v[19], 'week': v[21],
-            'accuracy': v[23], 'health': v[24], 'TGD': v[25], 'IODC': v[26],
-            'ttx': v[27], 'Toc': toc,
-        })
+        poster.append(_post_fran_varden(prn, epok, v))
         i += 8
     return poster
 
+def parsa_rinex3(text):
+    """RINEX 3 mixed nav: bara GPS-poster (rader som borjar med 'G')."""
+    rader = text.splitlines()
+    i = 0
+    while i < len(rader) and 'END OF HEADER' not in rader[i]:
+        i += 1
+    i += 1
+
+    def ar_poststart(rad):
+        return len(rad) > 3 and rad[0].isalpha() and rad[1:3].strip().isdigit()
+
+    poster = []
+    n = len(rader)
+    while i < n:
+        rad = rader[i]
+        if not ar_poststart(rad):
+            i += 1
+            continue
+        # Samla postens alla rader (start + fortsattningsrader)
+        block = [rad]
+        j = i + 1
+        while j < n and not ar_poststart(rader[j]):
+            if rader[j].strip():
+                block.append(rader[j])
+            j += 1
+        i = j
+        if rad[0] != 'G' or len(block) < 8:
+            continue   # bara GPS; andra system hoppas over
+        try:
+            prn  = int(rad[1:3])
+            epok = datetime(int(rad[4:8]), int(rad[9:11]), int(rad[12:14]),
+                            int(rad[15:17]), int(rad[18:20]), int(rad[21:23]),
+                            tzinfo=timezone.utc)
+            v = [_f(rad[23:42]), _f(rad[42:61]), _f(rad[61:80])]
+            for k in range(1, 8):
+                r = block[k]
+                for kol in (4, 23, 42, 61):
+                    v.append(_f(r[kol:kol+19]) if len(r) > kol else 0.0)
+        except (ValueError, IndexError):
+            continue
+        poster.append(_post_fran_varden(prn, epok, v))
+    return poster
+
+def parsa_rinex(text):
+    """Auto-detektera version fran headern."""
+    for rad in text.splitlines()[:5]:
+        if 'RINEX VERSION' in rad:
+            try:
+                if float(rad[:9]) >= 3.0:
+                    return parsa_rinex3(text)
+            except ValueError:
+                pass
+            return parsa_rinex2(text)
+    # Ingen header hittad - gissa utifran forsta postraden
+    return parsa_rinex3(text) if 'G0' in text[:2000] or 'G1' in text[:2000] else parsa_rinex2(text)
+
 # ------------------------------------------------------------------
 # Nedladdning fran BKG:s IGS-spegel (oppen, ingen inloggning)
+# Provar flera kanda filnamnsvarianter (RINEX 3 "long names").
 # ------------------------------------------------------------------
 def hamta_rinex():
     nu = datetime.now(timezone.utc)
+    kandidater = []
     for dagar_bakat in (0, 1):
         d = nu - timedelta(days=dagar_bakat)
-        doy = d.timetuple().tm_yday
-        url = (f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/"
-               f"{d.year}/{doy:03d}/brdc{doy:03d}0.{d.year % 100:02d}n.gz")
+        y, doy = d.year, d.timetuple().tm_yday
+        stam = f"{y}{doy:03d}0000_01D_MN.rnx.gz"
+        kandidater += [
+            # 24h glidande fonster, uppdateras var 15:e minut
+            f"https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/BRDC00WRD_S_{stam}",
+            f"https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/{y}/BRDC00WRD_S_{stam}",
+            f"https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/{y}/{doy:03d}/BRDC00WRD_S_{stam}",
+            # Dagliga sammanslagna filer
+            f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/BRDC00IGS_R_{stam}",
+            f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/BRDC00WRD_R_{stam}",
+            f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/BRDC00WRD_S_{stam}",
+            f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/BRDM00DLR_S_{stam}",
+        ]
+    for url in kandidater:
         try:
             print("Hamtar", url)
-            req = urllib.request.Request(url, headers={'User-Agent': 'korjournal-agps/1.0'})
+            req = urllib.request.Request(url, headers={'User-Agent': 'korjournal-agps/1.1'})
             data = urllib.request.urlopen(req, timeout=60).read()
+            print(f"  OK ({len(data)} byte)")
             return gzip.decompress(data).decode('ascii', errors='replace')
         except Exception as fel:
             print("  misslyckades:", fel)
-    raise SystemExit("Kunde inte hamta RINEX fran BKG (kolla URL-strukturen).")
+    raise SystemExit("Kunde inte hamta RINEX fran BKG (alla kandidat-URL:er misslyckades).")
 
 # ------------------------------------------------------------------
 # Huvudflode
 # ------------------------------------------------------------------
 def main():
     text = hamta_rinex()
-    poster = parsa_rinex2(text)
+    poster = parsa_rinex(text)
     print(f"{len(poster)} ephemeris-poster inlasta.")
 
     nu = datetime.now(timezone.utc)
