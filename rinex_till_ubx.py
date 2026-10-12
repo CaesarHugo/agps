@@ -264,17 +264,86 @@ def parsa_rinex(text):
     return parsa_rinex3(text) if 'G0' in text[:2000] or 'G1' in text[:2000] else parsa_rinex2(text)
 
 # ------------------------------------------------------------------
-# Nedladdning: lasa BKG:s katalogsidor och valja den nyaste GPS-nav-filen
-# som faktiskt finns, i stallet for att gissa exakta filnamn.
+# Dekomprimering: .gz (gzip) och .Z (Unix compress / LZW)
 # ------------------------------------------------------------------
-UA = {'User-Agent': 'korjournal-agps/1.3'}
+def unlzw(data):
+    """Ren Python-avkodare for Unix compress (.Z)."""
+    if len(data) < 3 or data[0] != 0x1F or data[1] != 0x9D:
+        raise ValueError("inte en .Z-fil")
+    maxbits = data[2] & 0x1F
+    blockmode = bool(data[2] & 0x80)
+    pos, n = 3, len(data)
+    bits = 9
+    tabell = [bytes([i]) for i in range(256)]
+    if blockmode:
+        tabell.append(b'')                     # kod 256 = CLEAR
+    ut = bytearray()
+    prev = None
+    bitbuf = bitcnt = 0
+    grupp_start = pos                          # koder lases i grupper om 'bits' byte
+    while True:
+        while bitcnt < bits and pos < n:
+            bitbuf |= data[pos] << bitcnt
+            bitcnt += 8
+            pos += 1
+        if bitcnt < bits:
+            break
+        kod = bitbuf & ((1 << bits) - 1)
+        bitbuf >>= bits
+        bitcnt -= bits
 
-def _http(url, timeout=20):
+        if blockmode and kod == 256:
+            # Hoppa till slutet av aktuell grupp (compress-egenhet), aterstall
+            lasta_bytes = pos - grupp_start
+            rest = (bits - lasta_bytes % bits) % bits
+            pos += rest
+            bitbuf = bitcnt = 0
+            tabell = tabell[:257]
+            bits = 9
+            grupp_start = pos
+            prev = None
+            continue
+
+        if kod < len(tabell):
+            post = tabell[kod]
+        elif kod == len(tabell) and prev is not None:
+            post = prev + prev[:1]
+        else:
+            raise ValueError("trasig .Z-data")
+        ut += post
+        if prev is not None and len(tabell) < (1 << maxbits):
+            tabell.append(prev + post[:1])
+        prev = post
+        if len(tabell) >= (1 << bits) and bits < maxbits:
+            # Byte av kodbredd: ocksa har hoppas resten av gruppen over
+            lasta_bytes = pos - grupp_start
+            rest = (bits - lasta_bytes % bits) % bits
+            pos += rest
+            bitbuf = bitcnt = 0
+            bits += 1
+            grupp_start = pos
+    return bytes(ut)
+
+def dekomprimera(data, namn):
+    if data[:2] == b'\x1f\x8b':
+        return gzip.decompress(data)
+    if data[:2] == b'\x1f\x9d':
+        return unlzw(data)
+    return data                                 # okomprimerad
+
+# ------------------------------------------------------------------
+# Nedladdning fran BKG.
+# 1) brdc_last.rnx.Z - BKG:s lopande uppdaterade fil med senaste ephemeriderna
+# 2) Reserv: las katalogsidor och ta den nyaste GPS-navfilen som finns
+# ------------------------------------------------------------------
+UA = {'User-Agent': 'korjournal-agps/1.4'}
+BKG = "https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/"
+
+def _http(url, timeout=30):
     req = urllib.request.Request(url, headers=UA)
     return urllib.request.urlopen(req, timeout=timeout).read()
 
 def _filer_i_katalog(url):
-    """Returnerar alla filnamn som katalogsidan lankar till."""
     html = _http(url).decode('utf-8', errors='replace')
     namn = set()
     for href in re.findall(r'href="([^"?#]+)"', html, re.IGNORECASE):
@@ -284,26 +353,34 @@ def _filer_i_katalog(url):
 def _rangordna(namn):
     """Lagre = battre. None = inte en anvandbar GPS-navfil."""
     n = namn.upper()
-    if n.endswith('.RNX.GZ') and ('_MN.' in n or '_GN.' in n):
-        stream = 0 if '_S_' in n else 1          # _S_ (stream) ar farskast
-        return stream
-    if re.match(r'^BRDC\d{4}\.\d{2}N\.GZ$', n):    # RINEX 2: brdcDDD0.YYn.gz
+    if re.search(r'\.RNX(\.GZ|\.Z)?$', n) and ('_MN.' in n or '_GN.' in n):
+        return 0 if '_S_' in n else 1
+    if re.match(r'^BRDC\d{4}\.\d{2}N(\.GZ|\.Z)?$', n):
         return 2
     return None
 
+def _hamta_och_packa_upp(url):
+    print("Hamtar", url, flush=True)
+    data = _http(url, timeout=60)
+    print(f"  OK ({len(data)} byte)", flush=True)
+    return dekomprimera(data, url).decode('ascii', errors='replace')
+
 def hamta_rinex():
+    # 1) Senaste-filen
+    for fil in ("brdc_last.rnx.Z", "brdc_last.rnx.gz", "brdc_last.rnx"):
+        try:
+            return _hamta_och_packa_upp(BKG + fil)
+        except Exception as fel:
+            print("  misslyckades:", fel, flush=True)
+
+    # 2) Reserv: katalogsokning
     nu = datetime.now(timezone.utc)
-    kataloger = []
+    kataloger = [BKG + "NTRIP/"]
     for dagar_bakat in (0, 1):
         d = nu - timedelta(days=dagar_bakat)
         y, doy = d.year, d.timetuple().tm_yday
-        kataloger += [
-            f"https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/{y}/{doy:03d}/",
-            f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/",
-        ]
-    # Rotkatalogen for NTRIP-strommen (ifall filerna ligger utan ar/dag-mappar)
-    kataloger.insert(1, "https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/")
-
+        kataloger += [f"{BKG}{y}/{doy:03d}/",
+                      f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/"]
     for kat in kataloger:
         try:
             print("Listar", kat, flush=True)
@@ -313,18 +390,13 @@ def hamta_rinex():
             continue
         traffar = [(r, f) for f in alla if (r := _rangordna(f)) is not None]
         if not traffar:
-            print(f"  inga GPS-navfiler bland {len(alla)} poster. Exempel: {alla[:15]}", flush=True)
+            print(f"  inga GPS-navfiler bland {len(alla)} poster: {alla[:30]}", flush=True)
             continue
-        # Basta typ forst, sedan nyast (filnamnen innehaller tidsstampel -> sortera fallande)
         traffar.sort(key=lambda t: t[1], reverse=True)
         traffar.sort(key=lambda t: t[0])
         for _, fil in traffar[:3]:
-            url = kat + fil
             try:
-                print("Hamtar", url, flush=True)
-                data = _http(url, timeout=60)
-                print(f"  OK ({len(data)} byte)", flush=True)
-                return gzip.decompress(data).decode('ascii', errors='replace')
+                return _hamta_och_packa_upp(kat + fil)
             except Exception as fel:
                 print("  misslyckades:", fel, flush=True)
     raise SystemExit("Kunde inte hamta RINEX fran nagon kalla.")
