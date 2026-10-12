@@ -23,6 +23,18 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Earthdata-inloggning (.netrc)
+        env:
+          ED_USER: ${{ secrets.EARTHDATA_USER }}
+          ED_PASS: ${{ secrets.EARTHDATA_PASS }}
+        run: |
+          if [ -z "$ED_USER" ] || [ -z "$ED_PASS" ]; then
+            echo "::error::Saknar secrets EARTHDATA_USER / EARTHDATA_PASS"
+            exit 1
+          fi
+          printf 'machine urs.earthdata.nasa.gov login %s password %s\n' "$ED_USER" "$ED_PASS" > ~/.netrc
+          chmod 600 ~/.netrc
+
       - name: Hamta RINEX och bygg aid.ubx
         run: |
           for i in 1 2; do
