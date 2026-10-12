@@ -1,4 +1,3 @@
-
 name: Bygg A-GPS-data
 
 on:
@@ -9,18 +8,30 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: agps
+  cancel-in-progress: false
+
 jobs:
   bygg:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Hamta RINEX och bygg aid.ubx
-        run: python3 rinex_till_ubx.py
+        run: |
+          for i in 1 2; do
+            python3 -u rinex_till_ubx.py && exit 0
+            echo "Forsok $i misslyckades, vantar 45 s..."
+            sleep 45
+          done
+          echo "::warning::Kunde inte hamta RINEX denna timme - behaller forra aid.ubx"
+          exit 1
 
       - name: Committa om filen andrats
         run: |
@@ -31,5 +42,6 @@ jobs:
             echo "Ingen andring."
           else
             git commit -m "Uppdaterad A-GPS-data $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git pull --rebase
             git push
           fi
