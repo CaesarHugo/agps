@@ -1,4 +1,4 @@
-import sys, re, math, gzip, struct, io, urllib.request, urllib.error
+import sys, os, re, math, gzip, struct, io, subprocess, tempfile
 from datetime import datetime, timedelta, timezone
 
 PI = 3.1415926535898  # GPS-standardens pi (IS-GPS-200)
@@ -332,78 +332,39 @@ def dekomprimera(data, namn):
     return data                                 # okomprimerad
 
 # ------------------------------------------------------------------
-# Kallor. Varje kalla provas i tur och ordning; en kalla godkanns forst
-# nar den faktiskt innehaller farska, friska GPS-ephemerider.
+# Kalla: NASA CDDIS (kraver gratis Earthdata-inloggning via ~/.netrc).
+# hourDDD0.YYn.gz = sammanslagen GPS-navfil for dagen, uppdateras varje
+# hel UTC-timme. Dagens och gardagens fil slas ihop sa att det alltid
+# finns farska poster, aven strax efter midnatt UTC.
 # ------------------------------------------------------------------
-UA = {'User-Agent': 'korjournal-agps/1.5'}
+CDDIS = "https://cddis.nasa.gov/archive/gnss/data"
 MAX_ALDER = timedelta(hours=5)
 
-def _http(url, timeout=30):
-    req = urllib.request.Request(url, headers=UA)
-    return urllib.request.urlopen(req, timeout=timeout).read()
-
-def _filer_i_katalog(url):
-    html = _http(url, timeout=20).decode('utf-8', errors='replace')
-    namn = set()
-    for href in re.findall(r'href="([^"?#]+)"', html, re.IGNORECASE):
-        n = href.rstrip('/').split('/')[-1]
-        if n and not n.startswith('.'):
-            namn.add(n)
-    return sorted(namn)
-
-def _rangordna(namn):
-    """Lagre = battre. None = inte en anvandbar GPS-navfil."""
-    n = namn.upper()
-    if re.search(r'\.RNX(\.GZ|\.Z)?$', n) and ('_MN.' in n or '_GN.' in n):
-        return 0 if '_S_' in n else 1
-    if re.match(r'^BRDC\d{4}\.\d{2}N(\.GZ|\.Z)?$', n) or re.match(r'^BRDC\.RNX(\.GZ|\.Z)?$', n):
-        return 2
-    if n.startswith('BRDC_LAST'):
-        return 3
-    return None
-
-_listade = set()
-
-def _sok_katalog(bas, djup=0):
-    """Hitta navfiler i 'bas'; kliv vid behov ner i ar- och dagsmappar."""
-    if bas in _listade:
-        return []
-    _listade.add(bas)
-    try:
-        print("Listar", bas, flush=True)
-        alla = _filer_i_katalog(bas)
-    except Exception as fel:
-        print("  misslyckades:", fel, flush=True)
-        return []
-    traffar = [(r, f) for f in alla if (r := _rangordna(f)) is not None]
-    if traffar:
-        traffar.sort(key=lambda t: t[1], reverse=True)
-        traffar.sort(key=lambda t: t[0])
-        return [bas + f for _, f in traffar[:3]]
-    if djup >= 2:
-        print(f"  inga navfiler: {alla[:30]}", flush=True)
-        return []
-    nu = datetime.now(timezone.utc)
-    urls = []
-    for dagar_bakat in (0, 1):
-        d = nu - timedelta(days=dagar_bakat)
-        for sub in (str(d.year), f"{d.timetuple().tm_yday:03d}"):
-            if sub in alla:
-                urls += _sok_katalog(bas + sub + "/", djup + 1)
-    if not urls:
-        print(f"  inga navfiler eller ar/dag-mappar: {alla[:30]}", flush=True)
-    return urls
+def hamta_cddis(url):
+    """Laddar ner med curl + .netrc (Earthdata-inloggningen kraver cookies och redirects)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ut, kakor = os.path.join(tmp, "f"), os.path.join(tmp, "kakor")
+        r = subprocess.run(["curl", "-sSfL", "--netrc", "-b", kakor, "-c", kakor,
+                            "--connect-timeout", "20", "--max-time", "120",
+                            "-o", ut, url], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip() or f"curl kod {r.returncode}")
+        data = open(ut, "rb").read()
+    if data[:1] == b"<":
+        raise RuntimeError("fick en HTML-sida i stallet for data (fel inloggning?)")
+    return data
 
 def kandidat_urler():
-    """Generator: URL:er i prioritetsordning. Kataloger listas forst nar de behovs."""
     nu = datetime.now(timezone.utc)
-    yield from _sok_katalog("https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/NTRIP/")
-    yield from _sok_katalog("https://igs.bkg.bund.de/root_ftp/IGS/BRDC/")
     for dagar_bakat in (0, 1):
         d = nu - timedelta(days=dagar_bakat)
         y, doy, yy = d.year, d.timetuple().tm_yday, d.year % 100
-        yield from _sok_katalog(f"https://igs.gnsswhu.cn/pub/gps/data/hourly/{y}/{doy:03d}/")
-    yield "https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/brdc_last.rnx.Z"
+        yield f"{CDDIS}/hourly/{y}/{doy:03d}/hour{doy:03d}0.{yy:02d}n.gz"
+    # Reserv: dagliga RINEX 3-filen (uppdateras nagra ganger per dag)
+    for dagar_bakat in (0, 1):
+        d = nu - timedelta(days=dagar_bakat)
+        y, doy = d.year, d.timetuple().tm_yday
+        yield f"{CDDIS}/daily/{y}/brdc/BRDC00IGS_R_{y}{doy:03d}0000_01D_MN.rnx.gz"
 
 def farska_poster(poster):
     nu = datetime.now(timezone.utc)
@@ -422,46 +383,34 @@ def farska_poster(poster):
 # Huvudflode
 # ------------------------------------------------------------------
 def main():
-    provade = set()
-    doda_vardar = set()
+    alla_poster = []
     for url in kandidat_urler():
-        vard = url.split('/')[2]
-        if url in provade or vard in doda_vardar:
-            continue
-        provade.add(url)
         try:
             print("Hamtar", url, flush=True)
-            data = _http(url, timeout=60)
-            print(f"  OK ({len(data)} byte)", flush=True)
+            data = hamta_cddis(url)
             text = dekomprimera(data, url).decode('ascii', errors='replace')
-        except urllib.error.HTTPError as fel:
+        except Exception as fel:
             print("  misslyckades:", fel, flush=True)
             continue
-        except Exception as fel:
-            print("  misslyckades (vard hoppas over):", fel, flush=True)
-            doda_vardar.add(vard)
-            continue
-
         poster = parsa_rinex(text)
-        if poster:
-            e = sorted(p['epok'] for p in poster)
-            print(f"  {len(poster)} GPS-poster, epoker {e[0]:%Y-%m-%d %H:%M} .. {e[-1]:%Y-%m-%d %H:%M} UTC", flush=True)
-        else:
-            print("  0 GPS-poster (fel format?)", flush=True)
+        if not poster:
+            print(f"  OK ({len(data)} byte) men 0 GPS-poster", flush=True)
             continue
+        e = sorted(p['epok'] for p in poster)
+        print(f"  OK ({len(data)} byte): {len(poster)} GPS-poster, "
+              f"{e[0]:%Y-%m-%d %H:%M} .. {e[-1]:%Y-%m-%d %H:%M} UTC", flush=True)
+        alla_poster += poster
+        if len(farska_poster(alla_poster)) >= 24:
+            break                      # tillrackligt manga satelliter - klart
 
-        farskast = farska_poster(poster)
-        if len(farskast) < 4:
-            print(f"  for gammal: bara {len(farskast)} farska satelliter - provar nasta kalla", flush=True)
-            continue
+    farskast = farska_poster(alla_poster)
+    if len(farskast) < 4:
+        raise SystemExit(f"Bara {len(farskast)} farska satelliter - filen skrivs inte.")
 
-        blob = b''.join(aid_eph(prn, farskast[prn]) for prn in sorted(farskast))
-        with open('aid.ubx', 'wb') as f:
-            f.write(blob)
-        print(f"OK aid.ubx skriven: {len(farskast)} satelliter, {len(blob)} byte (kalla: {url}).")
-        return
-
-    raise SystemExit("Ingen kalla gav farska ephemerider - filen skrivs inte.")
+    blob = b''.join(aid_eph(prn, farskast[prn]) for prn in sorted(farskast))
+    with open('aid.ubx', 'wb') as f:
+        f.write(blob)
+    print(f"OK aid.ubx skriven: {len(farskast)} satelliter, {len(blob)} byte.")
 
 # ------------------------------------------------------------------
 # Sjalvtest: packa -> packa upp -> jamfor (fangar bitpackningsfel)
