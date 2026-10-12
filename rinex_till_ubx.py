@@ -1,5 +1,4 @@
-
-import sys, math, gzip, struct, io, urllib.request
+import sys, math, gzip, struct, io, urllib.request, urllib.error
 from datetime import datetime, timedelta, timezone
 
 PI = 3.1415926535898  # GPS-standardens pi (IS-GPS-200)
@@ -265,8 +264,8 @@ def parsa_rinex(text):
     return parsa_rinex3(text) if 'G0' in text[:2000] or 'G1' in text[:2000] else parsa_rinex2(text)
 
 # ------------------------------------------------------------------
-# Nedladdning fran BKG:s IGS-spegel (oppen, ingen inloggning)
-# Provar flera kanda filnamnsvarianter (RINEX 3 "long names").
+# Nedladdning: BKG (realtid) + BKG FTP-vard + IGN Frankrike som reserv.
+# Vardar som timear ut hoppas over resten av korningen.
 # ------------------------------------------------------------------
 def hamta_rinex():
     nu = datetime.now(timezone.utc)
@@ -276,26 +275,31 @@ def hamta_rinex():
         y, doy = d.year, d.timetuple().tm_yday
         stam = f"{y}{doy:03d}0000_01D_MN.rnx.gz"
         kandidater += [
-            # 24h glidande fonster, uppdateras var 15:e minut
-            f"https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/BRDC00WRD_S_{stam}",
-            f"https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/{y}/BRDC00WRD_S_{stam}",
-            f"https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/{y}/{doy:03d}/BRDC00WRD_S_{stam}",
-            # Dagliga sammanslagna filer
-            f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/BRDC00IGS_R_{stam}",
-            f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/BRDC00WRD_R_{stam}",
-            f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/BRDC00WRD_S_{stam}",
-            f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/BRDM00DLR_S_{stam}",
+            # BKG nara-realtid (farska ephemerider - det som faktiskt behovs)
+            ("bkg",    f"https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/{y}/{doy:03d}/BRDC00WRD_S_{stam}"),
+            ("bkg",    f"https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/BRDC00WRD_S_{stam}"),
+            ("bkgftp", f"https://igs-ftp.bkg.bund.de/NTRIP/BRDC/{y}/{doy:03d}/BRDC00WRD_S_{stam}"),
+            # Dagliga sammanslagna filer (BKG + IGN Frankrike som oberoende spegel)
+            ("bkg",    f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/BRDC00IGS_R_{stam}"),
+            ("bkgftp", f"https://igs-ftp.bkg.bund.de/IGS/BRDC/{y}/{doy:03d}/BRDC00IGS_R_{stam}"),
+            ("ign",    f"https://igs.ign.fr/pub/igs/data/{y}/{doy:03d}/BRDC00IGS_R_{stam}"),
         ]
-    for url in kandidater:
+    doda_vardar = set()
+    for vard, url in kandidater:
+        if vard in doda_vardar:
+            continue
         try:
-            print("Hamtar", url)
-            req = urllib.request.Request(url, headers={'User-Agent': 'korjournal-agps/1.1'})
-            data = urllib.request.urlopen(req, timeout=60).read()
-            print(f"  OK ({len(data)} byte)")
+            print("Hamtar", url, flush=True)
+            req = urllib.request.Request(url, headers={'User-Agent': 'korjournal-agps/1.2'})
+            data = urllib.request.urlopen(req, timeout=20).read()
+            print(f"  OK ({len(data)} byte)", flush=True)
             return gzip.decompress(data).decode('ascii', errors='replace')
+        except urllib.error.HTTPError as fel:
+            print("  misslyckades:", fel, flush=True)   # 404 = varden lever, fel fil
         except Exception as fel:
-            print("  misslyckades:", fel)
-    raise SystemExit("Kunde inte hamta RINEX fran BKG (alla kandidat-URL:er misslyckades).")
+            print("  misslyckades (vard markeras dod):", fel, flush=True)
+            doda_vardar.add(vard)                        # timeout/DNS: hoppa over resten
+    raise SystemExit("Kunde inte hamta RINEX fran nagon kalla.")
 
 # ------------------------------------------------------------------
 # Huvudflode
