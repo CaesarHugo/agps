@@ -332,22 +332,23 @@ def dekomprimera(data, namn):
     return data                                 # okomprimerad
 
 # ------------------------------------------------------------------
-# Nedladdning fran BKG.
-# 1) brdc_last.rnx.Z - BKG:s lopande uppdaterade fil med senaste ephemeriderna
-# 2) Reserv: las katalogsidor och ta den nyaste GPS-navfilen som finns
+# Kallor. Varje kalla provas i tur och ordning; en kalla godkanns forst
+# nar den faktiskt innehaller farska, friska GPS-ephemerider.
 # ------------------------------------------------------------------
-UA = {'User-Agent': 'korjournal-agps/1.4'}
-BKG = "https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/"
+UA = {'User-Agent': 'korjournal-agps/1.5'}
+MAX_ALDER = timedelta(hours=5)
 
 def _http(url, timeout=30):
     req = urllib.request.Request(url, headers=UA)
     return urllib.request.urlopen(req, timeout=timeout).read()
 
 def _filer_i_katalog(url):
-    html = _http(url).decode('utf-8', errors='replace')
+    html = _http(url, timeout=20).decode('utf-8', errors='replace')
     namn = set()
     for href in re.findall(r'href="([^"?#]+)"', html, re.IGNORECASE):
-        namn.add(href.rstrip('/').split('/')[-1])
+        n = href.rstrip('/').split('/')[-1]
+        if n and not n.startswith('.'):
+            namn.add(n)
     return sorted(namn)
 
 def _rangordna(namn):
@@ -355,81 +356,112 @@ def _rangordna(namn):
     n = namn.upper()
     if re.search(r'\.RNX(\.GZ|\.Z)?$', n) and ('_MN.' in n or '_GN.' in n):
         return 0 if '_S_' in n else 1
-    if re.match(r'^BRDC\d{4}\.\d{2}N(\.GZ|\.Z)?$', n):
+    if re.match(r'^BRDC\d{4}\.\d{2}N(\.GZ|\.Z)?$', n) or re.match(r'^BRDC\.RNX(\.GZ|\.Z)?$', n):
         return 2
+    if n.startswith('BRDC_LAST'):
+        return 3
     return None
 
-def _hamta_och_packa_upp(url):
-    print("Hamtar", url, flush=True)
-    data = _http(url, timeout=60)
-    print(f"  OK ({len(data)} byte)", flush=True)
-    return dekomprimera(data, url).decode('ascii', errors='replace')
+_listade = set()
 
-def hamta_rinex():
-    # 1) Senaste-filen
-    for fil in ("brdc_last.rnx.Z", "brdc_last.rnx.gz", "brdc_last.rnx"):
-        try:
-            return _hamta_och_packa_upp(BKG + fil)
-        except Exception as fel:
-            print("  misslyckades:", fel, flush=True)
-
-    # 2) Reserv: katalogsokning
-    nu = datetime.now(timezone.utc)
-    kataloger = [BKG + "NTRIP/"]
-    for dagar_bakat in (0, 1):
-        d = nu - timedelta(days=dagar_bakat)
-        y, doy = d.year, d.timetuple().tm_yday
-        kataloger += [f"{BKG}{y}/{doy:03d}/",
-                      f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/"]
-    for kat in kataloger:
-        try:
-            print("Listar", kat, flush=True)
-            alla = _filer_i_katalog(kat)
-        except Exception as fel:
-            print("  misslyckades:", fel, flush=True)
-            continue
-        traffar = [(r, f) for f in alla if (r := _rangordna(f)) is not None]
-        if not traffar:
-            print(f"  inga GPS-navfiler bland {len(alla)} poster: {alla[:30]}", flush=True)
-            continue
+def _sok_katalog(bas, djup=0):
+    """Hitta navfiler i 'bas'; kliv vid behov ner i ar- och dagsmappar."""
+    if bas in _listade:
+        return []
+    _listade.add(bas)
+    try:
+        print("Listar", bas, flush=True)
+        alla = _filer_i_katalog(bas)
+    except Exception as fel:
+        print("  misslyckades:", fel, flush=True)
+        return []
+    traffar = [(r, f) for f in alla if (r := _rangordna(f)) is not None]
+    if traffar:
         traffar.sort(key=lambda t: t[1], reverse=True)
         traffar.sort(key=lambda t: t[0])
-        for _, fil in traffar[:3]:
-            try:
-                return _hamta_och_packa_upp(kat + fil)
-            except Exception as fel:
-                print("  misslyckades:", fel, flush=True)
-    raise SystemExit("Kunde inte hamta RINEX fran nagon kalla.")
+        return [bas + f for _, f in traffar[:3]]
+    if djup >= 2:
+        print(f"  inga navfiler: {alla[:30]}", flush=True)
+        return []
+    nu = datetime.now(timezone.utc)
+    urls = []
+    for dagar_bakat in (0, 1):
+        d = nu - timedelta(days=dagar_bakat)
+        for sub in (str(d.year), f"{d.timetuple().tm_yday:03d}"):
+            if sub in alla:
+                urls += _sok_katalog(bas + sub + "/", djup + 1)
+    if not urls:
+        print(f"  inga navfiler eller ar/dag-mappar: {alla[:30]}", flush=True)
+    return urls
 
-# ------------------------------------------------------------------
-# Huvudflode
-# ------------------------------------------------------------------
-def main():
-    text = hamta_rinex()
-    poster = parsa_rinex(text)
-    print(f"{len(poster)} ephemeris-poster inlasta.")
+def kandidat_urler():
+    """Generator: URL:er i prioritetsordning. Kataloger listas forst nar de behovs."""
+    nu = datetime.now(timezone.utc)
+    yield from _sok_katalog("https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/NTRIP/")
+    yield from _sok_katalog("https://igs.bkg.bund.de/root_ftp/IGS/BRDC/")
+    for dagar_bakat in (0, 1):
+        d = nu - timedelta(days=dagar_bakat)
+        y, doy, yy = d.year, d.timetuple().tm_yday, d.year % 100
+        yield from _sok_katalog(f"https://igs.gnsswhu.cn/pub/gps/data/hourly/{y}/{doy:03d}/")
+    yield "https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/brdc_last.rnx.Z"
 
+def farska_poster(poster):
     nu = datetime.now(timezone.utc)
     farskast = {}
     for p in poster:
         if int(p['health']) != 0:
             continue
-        if (nu - p['epok']) > timedelta(hours=5):
+        if not (timedelta(hours=-3) <= nu - p['epok'] <= MAX_ALDER):
             continue
         gammal = farskast.get(p['prn'])
         if gammal is None or p['epok'] > gammal['epok']:
             farskast[p['prn']] = p
+    return farskast
 
-    if not farskast:
-        raise SystemExit("Inga farska friska ephemerider hittades - filen skrivs inte.")
+# ------------------------------------------------------------------
+# Huvudflode
+# ------------------------------------------------------------------
+def main():
+    provade = set()
+    doda_vardar = set()
+    for url in kandidat_urler():
+        vard = url.split('/')[2]
+        if url in provade or vard in doda_vardar:
+            continue
+        provade.add(url)
+        try:
+            print("Hamtar", url, flush=True)
+            data = _http(url, timeout=60)
+            print(f"  OK ({len(data)} byte)", flush=True)
+            text = dekomprimera(data, url).decode('ascii', errors='replace')
+        except urllib.error.HTTPError as fel:
+            print("  misslyckades:", fel, flush=True)
+            continue
+        except Exception as fel:
+            print("  misslyckades (vard hoppas over):", fel, flush=True)
+            doda_vardar.add(vard)
+            continue
 
-    blob = b''
-    for prn in sorted(farskast):
-        blob += aid_eph(prn, farskast[prn])
+        poster = parsa_rinex(text)
+        if poster:
+            e = sorted(p['epok'] for p in poster)
+            print(f"  {len(poster)} GPS-poster, epoker {e[0]:%Y-%m-%d %H:%M} .. {e[-1]:%Y-%m-%d %H:%M} UTC", flush=True)
+        else:
+            print("  0 GPS-poster (fel format?)", flush=True)
+            continue
 
-    with open('aid.ubx', 'wb') as f:
-        f.write(blob)
-    print(f"OK aid.ubx skriven: {len(farskast)} satelliter, {len(blob)} byte.")
+        farskast = farska_poster(poster)
+        if len(farskast) < 4:
+            print(f"  for gammal: bara {len(farskast)} farska satelliter - provar nasta kalla", flush=True)
+            continue
+
+        blob = b''.join(aid_eph(prn, farskast[prn]) for prn in sorted(farskast))
+        with open('aid.ubx', 'wb') as f:
+            f.write(blob)
+        print(f"OK aid.ubx skriven: {len(farskast)} satelliter, {len(blob)} byte (kalla: {url}).")
+        return
+
+    raise SystemExit("Ingen kalla gav farska ephemerider - filen skrivs inte.")
 
 # ------------------------------------------------------------------
 # Sjalvtest: packa -> packa upp -> jamfor (fangar bitpackningsfel)
