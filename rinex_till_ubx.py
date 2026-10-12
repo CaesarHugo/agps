@@ -1,4 +1,4 @@
-import sys, math, gzip, struct, io, urllib.request, urllib.error
+import sys, re, math, gzip, struct, io, urllib.request, urllib.error
 from datetime import datetime, timedelta, timezone
 
 PI = 3.1415926535898  # GPS-standardens pi (IS-GPS-200)
@@ -264,41 +264,69 @@ def parsa_rinex(text):
     return parsa_rinex3(text) if 'G0' in text[:2000] or 'G1' in text[:2000] else parsa_rinex2(text)
 
 # ------------------------------------------------------------------
-# Nedladdning: BKG (realtid) + BKG FTP-vard + IGN Frankrike som reserv.
-# Vardar som timear ut hoppas over resten av korningen.
+# Nedladdning: lasa BKG:s katalogsidor och valja den nyaste GPS-nav-filen
+# som faktiskt finns, i stallet for att gissa exakta filnamn.
 # ------------------------------------------------------------------
+UA = {'User-Agent': 'korjournal-agps/1.3'}
+
+def _http(url, timeout=20):
+    req = urllib.request.Request(url, headers=UA)
+    return urllib.request.urlopen(req, timeout=timeout).read()
+
+def _filer_i_katalog(url):
+    """Returnerar alla filnamn som katalogsidan lankar till."""
+    html = _http(url).decode('utf-8', errors='replace')
+    namn = set()
+    for href in re.findall(r'href="([^"?#]+)"', html, re.IGNORECASE):
+        namn.add(href.rstrip('/').split('/')[-1])
+    return sorted(namn)
+
+def _rangordna(namn):
+    """Lagre = battre. None = inte en anvandbar GPS-navfil."""
+    n = namn.upper()
+    if n.endswith('.RNX.GZ') and ('_MN.' in n or '_GN.' in n):
+        stream = 0 if '_S_' in n else 1          # _S_ (stream) ar farskast
+        return stream
+    if re.match(r'^BRDC\d{4}\.\d{2}N\.GZ$', n):    # RINEX 2: brdcDDD0.YYn.gz
+        return 2
+    return None
+
 def hamta_rinex():
     nu = datetime.now(timezone.utc)
-    kandidater = []
+    kataloger = []
     for dagar_bakat in (0, 1):
         d = nu - timedelta(days=dagar_bakat)
         y, doy = d.year, d.timetuple().tm_yday
-        stam = f"{y}{doy:03d}0000_01D_MN.rnx.gz"
-        kandidater += [
-            # BKG nara-realtid (farska ephemerider - det som faktiskt behovs)
-            ("bkg",    f"https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/{y}/{doy:03d}/BRDC00WRD_S_{stam}"),
-            ("bkg",    f"https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/BRDC00WRD_S_{stam}"),
-            ("bkgftp", f"https://igs-ftp.bkg.bund.de/NTRIP/BRDC/{y}/{doy:03d}/BRDC00WRD_S_{stam}"),
-            # Dagliga sammanslagna filer (BKG + IGN Frankrike som oberoende spegel)
-            ("bkg",    f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/BRDC00IGS_R_{stam}"),
-            ("bkgftp", f"https://igs-ftp.bkg.bund.de/IGS/BRDC/{y}/{doy:03d}/BRDC00IGS_R_{stam}"),
-            ("ign",    f"https://igs.ign.fr/pub/igs/data/{y}/{doy:03d}/BRDC00IGS_R_{stam}"),
+        kataloger += [
+            f"https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/{y}/{doy:03d}/",
+            f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/",
         ]
-    doda_vardar = set()
-    for vard, url in kandidater:
-        if vard in doda_vardar:
-            continue
+    # Rotkatalogen for NTRIP-strommen (ifall filerna ligger utan ar/dag-mappar)
+    kataloger.insert(1, "https://igs.bkg.bund.de/root_ftp/NTRIP/BRDC/")
+
+    for kat in kataloger:
         try:
-            print("Hamtar", url, flush=True)
-            req = urllib.request.Request(url, headers={'User-Agent': 'korjournal-agps/1.2'})
-            data = urllib.request.urlopen(req, timeout=20).read()
-            print(f"  OK ({len(data)} byte)", flush=True)
-            return gzip.decompress(data).decode('ascii', errors='replace')
-        except urllib.error.HTTPError as fel:
-            print("  misslyckades:", fel, flush=True)   # 404 = varden lever, fel fil
+            print("Listar", kat, flush=True)
+            alla = _filer_i_katalog(kat)
         except Exception as fel:
-            print("  misslyckades (vard markeras dod):", fel, flush=True)
-            doda_vardar.add(vard)                        # timeout/DNS: hoppa over resten
+            print("  misslyckades:", fel, flush=True)
+            continue
+        traffar = [(r, f) for f in alla if (r := _rangordna(f)) is not None]
+        if not traffar:
+            print(f"  inga GPS-navfiler bland {len(alla)} poster. Exempel: {alla[:15]}", flush=True)
+            continue
+        # Basta typ forst, sedan nyast (filnamnen innehaller tidsstampel -> sortera fallande)
+        traffar.sort(key=lambda t: t[1], reverse=True)
+        traffar.sort(key=lambda t: t[0])
+        for _, fil in traffar[:3]:
+            url = kat + fil
+            try:
+                print("Hamtar", url, flush=True)
+                data = _http(url, timeout=60)
+                print(f"  OK ({len(data)} byte)", flush=True)
+                return gzip.decompress(data).decode('ascii', errors='replace')
+            except Exception as fel:
+                print("  misslyckades:", fel, flush=True)
     raise SystemExit("Kunde inte hamta RINEX fran nagon kalla.")
 
 # ------------------------------------------------------------------
